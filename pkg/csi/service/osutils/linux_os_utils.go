@@ -27,7 +27,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/akutz/gofsutil"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -108,7 +107,7 @@ func (osUtils *OsUtils) NodeStageBlockVolume(
 	// Mount Volume.
 	// Fetch dev mounts to check if the device is already staged.
 	log.Debugf("nodeStageBlockVolume: Fetching device mounts")
-	mnts, err := gofsutil.GetDevMounts(ctx, dev.RealDev)
+	allMnts, err := osUtils.getMountsForDev(dev)
 	if err != nil {
 		return nil, logger.LogNewErrorCodef(log, codes.Internal,
 			"could not reliably determine existing mount status. Parameters: %v err: %v", params, err)
@@ -121,7 +120,7 @@ func (osUtils *OsUtils) NodeStageBlockVolume(
 			log.Debugf("nodeStageBlockVolume: Mounting %q at %q in read-only mode with mount flags %v",
 				dev.FullPath, params.StagingTarget, params.MntFlags)
 			params.MntFlags = append(params.MntFlags, "ro")
-			err := gofsutil.Mount(ctx, dev.FullPath, params.StagingTarget, params.FsType, params.MntFlags...)
+			err := osUtils.Mounter.Mount(dev.FullPath, params.StagingTarget, params.FsType, params.MntFlags)
 			if err != nil {
 				return nil, logger.LogNewErrorCodef(log, codes.Internal,
 					"error mounting volume. Parameters: %v err: %v", params, err)
@@ -132,7 +131,7 @@ func (osUtils *OsUtils) NodeStageBlockVolume(
 		// Format and mount the device.
 		log.Debugf("nodeStageBlockVolume: Format and mount the device %q at %q with mount flags %v",
 			dev.FullPath, params.StagingTarget, params.MntFlags)
-		err := gofsutil.FormatAndMount(ctx, dev.FullPath, params.StagingTarget, params.FsType, params.MntFlags...)
+		err := osUtils.Mounter.FormatAndMount(dev.FullPath, params.StagingTarget, params.FsType, params.MntFlags)
 		if err != nil {
 			return nil, logger.LogNewErrorCodef(log, codes.Internal,
 				"error in formating and mounting volume. Parameters: %v err: %v", params, err)
@@ -167,6 +166,22 @@ func (osUtils *OsUtils) NodeStageBlockVolume(
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
+func (osUtils *OsUtils) getMountsForDev(dev *Device) ([]mount.MountPoint, error) {
+	allMnts, err := osUtils.Mounter.List()
+	if err != nil {
+		return nil, logger.LogNewErrorCodef(log, codes.Internal,
+			"could not reliably determine existing mount status. Parameters: %v err: %v", params, err)
+	}
+	mnts := make([]mount.MountPoint, 0)
+	for _, mnt := range allMnts {
+		if mnt.Device == dev.RealDev {
+			mnts = append(mnts, mnt)
+		}
+	}
+	return mnts, nil
+}
+
+
 // CleanupStagePath will unmount the volume from node and remove the stage directory
 func (osUtils *OsUtils) CleanupStagePath(ctx context.Context, stagingTarget string, volID string) error {
 	log := logger.GetLogger(ctx)
@@ -179,7 +194,7 @@ func (osUtils *OsUtils) CleanupStagePath(ctx context.Context, stagingTarget stri
 	// Volume is still mounted. Unstage the volume.
 	if isMounted {
 		log.Infof("Attempting to unmount target %q for volume %q", stagingTarget, volID)
-		if err := gofsutil.Unmount(ctx, stagingTarget); err != nil {
+		if err := osUtils.Mounter.Unmount(stagingTarget); err != nil {
 			return fmt.Errorf(
 				"error unmounting stagingTarget: %v", err)
 		}
@@ -221,7 +236,7 @@ func (osUtils *OsUtils) IsBlockVolumeMounted(
 		volID, dev.FullPath, dev.RealDev, stagingTargetPath)
 
 	// Get mounts for device.
-	mnts, err := gofsutil.GetDevMounts(ctx, dev.RealDev)
+	mnts, err := osUtils.getMountsForDev(dev)
 	if err != nil {
 		return false, logger.LogNewErrorCodef(log, codes.Internal,
 			"isBlockVolumeMounted: could not reliably determine existing mount status: %s",
@@ -287,7 +302,7 @@ func (osUtils *OsUtils) CleanupPublishPath(ctx context.Context, target string, v
 
 	if isPublished {
 		log.Infof("NodeUnpublishVolume: Attempting to unmount target %q for volume %q", target, volID)
-		if err := gofsutil.Unmount(ctx, target); err != nil {
+		if err := osUtils.Mounter.Unmount(target); err != nil {
 			return fmt.Errorf(
 				"error unmounting target %q for volume %q. %q", target, volID, err.Error())
 		}
@@ -589,7 +604,7 @@ func (osUtils *OsUtils) PublishFileVol(
 	// Directly mount the file share volume to the pod. No bind mount required.
 	log.Debugf("PublishFileVolume: Attempting to mount %q to %q with fstype %q and mountflags %v",
 		mntSrc, params.Target, fsType, mntFlags)
-	if err := gofsutil.Mount(ctx, mntSrc, params.Target, fsType, mntFlags...); err != nil {
+	if err := osUtils.Mounter.Mount(mntSrc, params.Target, fsType, mntFlags); err != nil {
 		return nil, logger.LogNewErrorCodef(log, codes.Internal,
 			"error publish volume to target path: %v", err)
 	}
