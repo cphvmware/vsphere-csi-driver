@@ -107,7 +107,7 @@ func (osUtils *OsUtils) NodeStageBlockVolume(
 	// Mount Volume.
 	// Fetch dev mounts to check if the device is already staged.
 	log.Debugf("nodeStageBlockVolume: Fetching device mounts")
-	allMnts, err := osUtils.getMountsForDev(dev)
+	mnts, err := osUtils.getMountsForDev(dev)
 	if err != nil {
 		return nil, logger.LogNewErrorCodef(log, codes.Internal,
 			"could not reliably determine existing mount status. Parameters: %v err: %v", params, err)
@@ -169,8 +169,7 @@ func (osUtils *OsUtils) NodeStageBlockVolume(
 func (osUtils *OsUtils) getMountsForDev(dev *Device) ([]mount.MountPoint, error) {
 	allMnts, err := osUtils.Mounter.List()
 	if err != nil {
-		return nil, logger.LogNewErrorCodef(log, codes.Internal,
-			"could not reliably determine existing mount status. Parameters: %v err: %v", params, err)
+		return nil, err
 	}
 	mnts := make([]mount.MountPoint, 0)
 	for _, mnt := range allMnts {
@@ -274,7 +273,7 @@ func (osUtils *OsUtils) CleanupPublishPath(ctx context.Context, target string, v
 	}
 
 	// Fetch all the mount points.
-	mnts, err := gofsutil.GetMounts(ctx)
+	mnts, err := osUtils.Mounter.List()
 	if err != nil {
 		return fmt.Errorf(
 			"could not retrieve existing mount points: %q", err.Error())
@@ -466,7 +465,8 @@ func (osUtils *OsUtils) PublishMountVol(
 	}
 	log.Debugf("PublishMountVolume: Attempting to bind mount %q to %q with mount flags %v",
 		params.StagingTarget, params.Target, mntFlags)
-	if err := gofsutil.BindMount(ctx, params.StagingTarget, params.Target, mntFlags...); err != nil {
+	mntFlags = maybeAddBindFlag(mntFlags)
+	if err := osUtils.Mounter.Mount(params.StagingTarget, params.Target, "", mntFlags); err != nil {
 		return nil, logger.LogNewErrorCodef(log, codes.Internal,
 			"error mounting volume. Parameters: %v err: %v", params, err)
 	}
@@ -517,7 +517,8 @@ func (osUtils *OsUtils) PublishBlockVol(
 		mntFlags := make([]string, 0)
 		log.Debugf("PublishBlockVolume: Attempting to bind mount %q to %q with mount flags %v",
 			dev.FullPath, params.Target, mntFlags)
-		if err := gofsutil.BindMount(ctx, dev.FullPath, params.Target, mntFlags...); err != nil {
+		mntFlags = maybeAddBindFlag(mntFlags)
+		if err := osUtils.Mounter.Mount(dev.FullPath, params.Target, "", mntFlags); err != nil {
 			return nil, logger.LogNewErrorCodef(log, codes.Internal,
 				"error mounting volume. Parameters: %v err: %v", params, err)
 		}
@@ -563,7 +564,7 @@ func (osUtils *OsUtils) PublishFileVol(
 	log.Debugf("PublishFileVolume: Created target path %q", params.Target)
 
 	// Check if target already mounted.
-	mnts, err := gofsutil.GetMounts(ctx)
+	mnts, err := osUtils.Mounter.List()
 	if err != nil {
 		return nil, logger.LogNewErrorCodef(log, codes.Internal,
 			"could not retrieve existing mount points: %v", err)
@@ -829,18 +830,16 @@ func (osUtils *OsUtils) Rmpath(ctx context.Context, target string) error {
 	return nil
 }
 
-// A wrapper around gofsutil.GetMounts that handles bind mounts.
-func (osUtils *OsUtils) GetDevMounts(ctx context.Context,
-	sysDevice *Device) ([]gofsutil.Info, error) {
+// A wrapper around mount.List() that handles bind mounts.
+func (osUtils *OsUtils) GetDevMounts(ctx context.Context, sysDevice *Device) ([]mount.MountPoint, error) {
+	devMnts := make([]mount.MountPoint, 0)
 
-	devMnts := make([]gofsutil.Info, 0)
-
-	mnts, err := gofsutil.GetMounts(ctx)
+	mnts, err := osUtils.Mounter.List()
 	if err != nil {
 		return devMnts, err
 	}
 	for _, m := range mnts {
-		if m.Device == sysDevice.RealDev || (m.Device == "devtmpfs" && m.Source == sysDevice.RealDev) {
+		if m.Device == sysDevice.RealDev {
 			devMnts = append(devMnts, m)
 		}
 	}
@@ -895,10 +894,13 @@ func (osUtils *OsUtils) ConvertUUID(uuid string) (string, error) {
 func (osUtils *OsUtils) GetDevFromMount(ctx context.Context, target string) (*Device, error) {
 
 	// Get list of all mounts on system.
-	mnts, err := gofsutil.GetMounts(context.Background())
+	mnts, err := osUtils.Mounter.List()
 	if err != nil {
 		return nil, err
 	}
+
+	// Following examples are from gofsutils, which used /proc/self/mountinfo as the source.
+	// The mount-utils package uses /proc/self/mounts, which has less information.
 
 	// example for RAW block device.
 	// Device:udev
@@ -939,9 +941,6 @@ func (osUtils *OsUtils) GetDevFromMount(ctx context.Context, target string) (*De
 		if unescape(ctx, m.Path) == target {
 			// Something is mounted to target, get underlying disk.
 			d := m.Device
-			if m.Device == "udev" || m.Device == "devtmpfs" {
-				d = m.Source
-			}
 			dev, err := osUtils.GetDevice(ctx, d)
 			if err != nil {
 				return nil, err
@@ -957,7 +956,7 @@ func (osUtils *OsUtils) GetDevFromMount(ctx context.Context, target string) (*De
 // IsTargetInMounts checks if a path exists in the mounts
 func (osUtils *OsUtils) IsTargetInMounts(ctx context.Context, path string) (bool, error) {
 	log := logger.GetLogger(ctx)
-	mnts, err := gofsutil.GetMounts(ctx)
+	mnts, err := osUtils.Mounter.List()
 	if err != nil {
 		return false, err
 	}
@@ -1041,7 +1040,7 @@ func (osUtils *OsUtils) VerifyVolumeAttachedAndFillParams(ctx context.Context,
 // IsFileVolumeMount loops through the list of mount points and
 // checks if the target path mount point is a file volume type or not.
 // Returns an error if the target path is not found in the mount points.
-func isFileVolumeMount(ctx context.Context, target string, mnts []gofsutil.Info) (bool, error) {
+func isFileVolumeMount(ctx context.Context, target string, mnts []mount.MountPoint) (bool, error) {
 	log := logger.GetLogger(ctx)
 	for _, m := range mnts {
 		if unescape(ctx, m.Path) == target {
@@ -1059,7 +1058,7 @@ func isFileVolumeMount(ctx context.Context, target string, mnts []gofsutil.Info)
 
 // IsTargetInMounts checks if the given target path is present in list of
 // mount points.
-func isTargetInMounts(ctx context.Context, target string, mnts []gofsutil.Info) bool {
+func isTargetInMounts(ctx context.Context, target string, mnts []mount.MountPoint) bool {
 	log := logger.GetLogger(ctx)
 	for _, m := range mnts {
 		if unescape(ctx, m.Path) == target {
@@ -1094,4 +1093,13 @@ func unescape(ctx context.Context, in string) string {
 		s = tail
 	}
 	return string(out)
+}
+
+func maybeAddBindFlag(flags []string) ([]string) {
+	for _, flag := range flags {
+		if flag == "bind" {
+			return flags
+		}
+	}
+	return append(flags, "bind")
 }
